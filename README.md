@@ -65,6 +65,22 @@ filmweb --since 2026-10-19 <username> <cookie>
 
 Dlaczego lista ocen jest pobierana w całości, a nie tylko do pierwszej starszej oceny? Filmweb zwraca oceny w stałej kolejności (domyślnie od najnowszej dodanej), ale pole `timestamp` to czas ostatniej zmiany oceny. Gdy zmienisz ocenę starego filmu, jego `timestamp` jest nowy, a pozycja na liście pozostaje zwykle na dawnym miejscu. Pobieranie od początku i przerwanie na pierwszej starej ocenie pominęłoby takie zmiany. Dodatkowo strony listy są pobierane równolegle, więc kolejność w pliku wynikowym nie jest chronologiczna.
 
+### Dodatkowe informacje o tytułach
+
+Opcja `--details` dodaje do eksportu kolumny `poster_url`, `genres`, `countries`, `duration` i `directors` (patrz [Dostępne dane](#dostępne-dane)). Wymaga to jednego dodatkowego zapytania do API na każdy tytuł, dlatego jest wyłączona domyślnie. Najlepiej łączyć ją z `--since`:
+
+```bash
+filmweb --details --since 2026-10-19 <username> <cookie>
+```
+
+W pliku csv wartości będące listami (gatunki, kraje, reżyserzy) są łączone średnikiem, w json zostają listami.
+
+Komenda `details` wypisuje te same informacje (w formacie json, na standardowe wyjście) dla dowolnych tytułów podanych przez id filmweb (nie jest potrzebne cookie):
+
+```bash
+filmweb details 643915 785625 > details.json
+```
+
 ### Skąd wziąć cookie?
 
  - [Network Monitor w przeglądarce](cookies_browser.md)
@@ -123,7 +139,12 @@ $ filmweb -h
 filmweb
 
 Usage:
-    filmweb [--format=<fileformat>]... [--type=<titletype>]... [--workers=<n>] [--pages=<range>] [--since=<date>] [--debug] <username> <cookie>
+    filmweb details [--workers=<n>] [--debug] <id>...
+    filmweb [--format=<fileformat>]... [--type=<titletype>]... [--workers=<n>] [--pages=<range>] [--since=<date>] [--details] [--debug] <username> <cookie>
+
+Commands:
+    details <id>...               Print extended info (poster url, genres, countries,
+                                  duration, directors) about given titles as JSON
 
 Options:
     -h --help                     Show this screen
@@ -135,6 +156,9 @@ Options:
     -s --since=<date>             Export only titles rated (or re-rated) on or after
                                   given date, inclusive, format YYYY-MM-DD
                                   (default: all titles)
+    --details                     Add extended info (poster url, genres, countries,
+                                  duration, directors) to export, needs one more
+                                  API request per title
     -d --debug                    Debug prints
 
 Source:
@@ -158,6 +182,11 @@ movie\_id | _id filmu_ (filmweb)
 title\_type | _typ tytułu_ (movie, tv\_show, game)
 title\_sub\_type | _podtyp tytułu_ (np. serial\_tv, mini\_serial)
 url | _strona filmu_
+poster\_url | _adres plakatu_ (tylko z `--details`)
+genres | _gatunki_ (tylko z `--details`)
+countries | _kraje produkcji_, kody ISO, np. US (tylko z `--details`)
+duration | _czas trwania w minutach_ (tylko z `--details`)
+directors | _reżyserzy_ (tylko z `--details`)
 
 ## DEV
 

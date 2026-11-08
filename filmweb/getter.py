@@ -78,12 +78,23 @@ def get_global_rating(title_id):
     return json.dumps(data)
 
 
-def _get_json(url, cookie, func_name):
+def get_details(title_id):
+    """
+    Get extended info about a title (genres, countries, poster etc.)
+    """
+    url = f"https://www.filmweb.pl/api/v1/film/{title_id}/preview"
+    data = _get_json(url, "", "get_details", {"x-locale": "pl-PL"})
+    data["entity"] = title_id
+    return json.dumps(data)
+
+
+def _get_json(url, cookie, func_name, extra_headers=None):
     """
     Wrapper for request and unified error
     """
     try:
-        response = requests.get(url, headers={"Cookie": cookie, **HEADERS})
+        headers = {"Cookie": cookie, **HEADERS, **(extra_headers or {})}
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
         content = response.json()
     except Exception as e:  # noqa

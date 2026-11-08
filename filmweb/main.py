@@ -1,7 +1,12 @@
 """filmweb
 
 Usage:
-    filmweb [--format=<fileformat>]... [--type=<titletype>]... [--workers=<n>] [--pages=<range>] [--since=<date>] [--debug] <username> <cookie>
+    filmweb details [--workers=<n>] [--debug] <id>...
+    filmweb [--format=<fileformat>]... [--type=<titletype>]... [--workers=<n>] [--pages=<range>] [--since=<date>] [--details] [--debug] <username> <cookie>
+
+Commands:
+    details <id>...               Print extended info (poster url, genres, countries,
+                                  duration, directors) about given titles as JSON
 
 Options:
     -h --help                     Show this screen
@@ -13,6 +18,9 @@ Options:
     -s --since=<date>             Export only titles rated (or re-rated) on or after
                                   given date, inclusive, format YYYY-MM-DD
                                   (default: all titles)
+    --details                     Add extended info (poster url, genres, countries,
+                                  duration, directors) to export, needs one more
+                                  API request per title
     -d --debug                    Debug prints
 
 Source:
@@ -126,21 +134,53 @@ def _resolve_workers(raw_workers):
         raise AssertionError(f"--workers must be positive integer, got: {raw_workers}")
 
 
+def _parse_ids(raw_ids):
+    """Parse title ids given to details command, drop duplicates, keep order"""
+    for raw_id in raw_ids:
+        assert raw_id.isdigit(), f"Title id must be a number, got: {raw_id}"
+    return tuple(dict.fromkeys(int(raw_id) for raw_id in raw_ids))
+
+
+def details(raw_ids, workers):
+    """Print extended info about titles with given ids (json to stdout)"""
+    ids = _parse_ids(raw_ids)
+    pool = multiprocessing.Pool(processes=min(workers, len(ids)))
+    try:
+        logger.info("Fetching details...")
+        raw_details = tuple(
+            json.loads(el)
+            for el in tqdm.tqdm(
+                pool.imap_unordered(getter.get_details, ids), total=len(ids)
+            )
+        )
+        details_by_id = {entry["entity"]: entry for entry in raw_details}
+        titles = [parser.parse_details(details_by_id[title_id]) for title_id in ids]
+        print(json.dumps(titles, ensure_ascii=False, indent=2))
+    except Exception as e:  # noqa
+        logger.error(f"Program error: {e!s}")
+    finally:
+        pool.close()
+
+
 def main():
     args = docopt(__doc__)
+    if args["--debug"]:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    if args["details"]:
+        return details(args["<id>"], _resolve_workers(args["--workers"]))
     user = args["<username>"]
     cookie = args["<cookie>"]
     assert all([user, cookie]), "Empty arguments provided"
     formats = {f.lower() for f in (args["--format"] or ("json",))}
     assert formats and formats.issubset(FORMATS), f"Supported file formats: {FORMATS}"
     title_types = _normalize_title_types(args["--type"])
-    if args["--debug"]:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
     first_page, last_page = _parse_pages(args["--pages"])
     raw_since = args["--since"]
     since_ms = _parse_since(raw_since)
+    with_details = args["--details"]
+    steps = 5 if with_details else 4
     workers = _resolve_workers(args["--workers"])
     pool = multiprocessing.Pool(processes=workers)
     try:
@@ -149,7 +189,7 @@ def main():
         logged_in_user = getter.auth_check(cookie)
         friend_query = user != logged_in_user
         user_ratings_by_type = []
-        logger.info("Fetching list of rated titles [1/4]...")
+        logger.info(f"Fetching list of rated titles [1/{steps}]...")
         for title_type in title_types:
             api_title_type = TITLE_TYPE_TO_API[title_type]
             votes_total = getter.get_votes_count(user, api_title_type)
@@ -194,22 +234,33 @@ def main():
         logger.info(f"User {user} has {total_titles} rated titles{since_msg}...")
         assert total_titles, "No rated titles available"
         ids = tuple(el.get("entity") for el in user_ratings)
-        logger.info("Fetching info about titles [2/4]...")
+        logger.info(f"Fetching info about titles [2/{steps}]...")
         global_info = tuple(
             json.loads(el)
             for el in tqdm.tqdm(
                 pool.imap_unordered(getter.get_global_info, ids), total=total_titles
             )
         )
-        logger.info("Fetching global rating for titles [3/4]...")
+        logger.info(f"Fetching global rating for titles [3/{steps}]...")
         global_rating = tuple(
             json.loads(el)
             for el in tqdm.tqdm(
                 pool.imap_unordered(getter.get_global_rating, ids), total=total_titles
             )
         )
-        logger.info("Writing data [4/4]...")
-        movies = parser.merge_data(ids, user_ratings, global_info, global_rating)
+        titles_details = None
+        if with_details:
+            logger.info(f"Fetching details for titles [4/{steps}]...")
+            titles_details = tuple(
+                parser.parse_details(json.loads(el))
+                for el in tqdm.tqdm(
+                    pool.imap_unordered(getter.get_details, ids), total=total_titles
+                )
+            )
+        logger.info(f"Writing data [{steps}/{steps}]...")
+        movies = parser.merge_data(
+            ids, user_ratings, global_info, global_rating, titles_details
+        )
         parser.write_data(movies, user, formats)
     except Exception as e:  # noqa
         logger.error(f"Program error: {e!s}")

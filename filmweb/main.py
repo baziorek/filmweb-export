@@ -1,16 +1,14 @@
 """filmweb
 
 Usage:
-    filmweb details [--workers=<n>] [--debug] <id>...
-    filmweb [--format=<fileformat>]... [--type=<titletype>]... [--workers=<n>] [--pages=<range>] [--since=<date>] [--details] [--debug] <username> <cookie>
-
-Commands:
-    details <id>...               Print extended info (poster url, genres, countries,
-                                  duration, directors) about given titles as JSON
+    filmweb details [--format=<fileformat>]... [--stdout] [--workers=<n>] [--debug] <id>...
+    filmweb search [--format=<fileformat>]... [--stdout] [--type=<titletype>]... [--limit=<n>] [--page=<n>] [--strict] [--embed-images] [--workers=<n>] [--debug] <query>...
+    filmweb [--format=<fileformat>]... [--stdout] [--type=<titletype>]... [--workers=<n>] [--pages=<range>] [--since=<date>] [--debug] <username> <cookie>
 
 Options:
     -h --help                     Show this screen
     -f --format=<fileformat>      Output file format: json (default), csv, letterboxd
+    -o --stdout                   Print result to stdout instead of file
     -t --type=<titletype>         Title type: movie, tv_show, game (default: all)
     -w --workers=<n>              Number of parallel workers (default: CPU count)
     -p --pages=<range>            Fetch only given pages of ratings list (100 titles per page),
@@ -18,9 +16,12 @@ Options:
     -s --since=<date>             Export only titles rated (or re-rated) on or after
                                   given date, inclusive, format YYYY-MM-DD
                                   (default: all titles)
-    --details                     Add extended info (poster url, genres, countries,
-                                  duration, directors) to export, needs one more
-                                  API request per title
+    -l --limit=<n>                Search: max number of titles to return (default: 10)
+    --page=<n>                    Search: first page of results to read (default: 1)
+    -S --strict                   Search: keep only titles whose matched title contains
+                                  all words of the query (default: any word)
+    -e --embed-images             Search: embed posters in json as base64 data uri
+                                  (field poster_image, json format only)
     -d --debug                    Debug prints
 
 Source:
@@ -32,134 +33,172 @@ import json
 import logging
 import multiprocessing
 import re
-from datetime import datetime
 from math import ceil
 
 import tqdm
 from docopt import docopt
 
-from . import getter, parser
+from . import getter, parser, writer
 
 logger = logging.getLogger(__name__)
 
 CPU_COUNT = multiprocessing.cpu_count()
 MOVIES_PER_PAGE = 100
-FORMATS = {"csv", "json", "letterboxd"}
-DEFAULT_TITLE_TYPES = ("movie", "tv_show", "game")
-TITLE_TYPE_TO_API = {"movie": "film", "tv_show": "serial", "game": "videogame"}
-TITLE_TYPE_ALIASES = {
-    "film": "movie",
-    "films": "movie",
-    "movie": "movie",
-    "movies": "movie",
-    "serial": "tv_show",
-    "series": "tv_show",
-    "show": "tv_show",
-    "shows": "tv_show",
-    "tv": "tv_show",
-    "tvshow": "tv_show",
-    "tvshows": "tv_show",
-    "tv_show": "tv_show",
-    "tv_shows": "tv_show",
-    "gra": "game",
-    "gry": "game",
-    "videogame": "game",
-    "videogames": "game",
-    "game": "game",
-    "games": "game",
-}
+MAX_SEARCH_PAGES = 5  # max requests made by one search, see search()
 
 
-def _normalize_title_types(raw_types):
-    """Normalize user title type values to supported API types"""
-    normalized = []
-    seen = set()
-    for title_type in raw_types or DEFAULT_TITLE_TYPES:
-        key = title_type.lower().strip()
-        resolved_types = (
-            DEFAULT_TITLE_TYPES if key == "all" else (TITLE_TYPE_ALIASES.get(key),)
+def _get_details(ids: tuple[int], pool: multiprocessing.Pool):
+    """Fetch details for given ids"""
+    details = tuple(
+        json.loads(el)
+        for el in tqdm.tqdm(
+            pool.imap_unordered(getter.get_preview, ids), total=len(ids)
         )
-        assert all(resolved_types), f"Unsupported title type: {title_type}"
-        for resolved in resolved_types:
-            if resolved not in seen:
-                normalized.append(resolved)
-                seen.add(resolved)
-    return tuple(normalized)
-
-
-def _parse_pages(raw_pages):
-    """Parse --pages value into (first, last) tuple, last=None means 'to the end'"""
-    if raw_pages is None:
-        return (1, None)
-    match = re.fullmatch(r"\s*(\d+)\s*(-\s*(\d*))?\s*", raw_pages)
-    assert match, f"--pages must look like 3, 2-5 or 4-, got: {raw_pages}"
-    first = int(match.group(1))
-    if match.group(2) is None:
-        last = first
-    else:
-        last = int(match.group(3)) if match.group(3) else None
-    assert first >= 1, "--pages must start at page 1 or later"
-    assert last is None or last >= first, (
-        "--pages range end must not be lower than its start"
     )
-    return (first, last)
+    details = tuple(parser.parse_details(d) for d in details)
+    return details
 
 
-def _parse_since(raw_since):
-    """
-    Parse --since value (YYYY-MM-DD) into timestamp in ms, None means 'no limit'.
-    The day is inclusive: the limit is local midnight, the same timezone
-    that is used for the `date` column in the output.
-    """
-    if raw_since is None:
-        return 0
-    try:
-        since = datetime.strptime(raw_since.strip(), "%Y-%m-%d")
-    except ValueError:
-        raise AssertionError(f"--since must look like 2026-10-19, got: {raw_since}")
-    return int(since.timestamp() * 1000)
+def details(args: dict, pool: multiprocessing.Pool):
+    """Get extended info about titles with given ids"""
+    ids = parser.parse_ids(args["<id>"])
+    logger.info("Fetching info about titles [1/2]...")
+    details = _get_details(ids, pool)
+    logger.info("Fetching global rating for titles [2/2]...")
+    global_rating = tuple(
+        json.loads(el)
+        for el in tqdm.tqdm(
+            pool.imap_unordered(getter.get_global_rating, ids), total=len(ids)
+        )
+    )
+    return parser.merge_data(
+        ids,
+        [details, global_rating],
+    )
 
 
-def _resolve_workers(raw_workers):
-    """Number of parallel workers: CPU count by default"""
-    if raw_workers is None:
-        return CPU_COUNT
-    try:
-        workers = int(raw_workers)
-        assert workers >= 1, "--workers must be at least 1"
-        if workers > CPU_COUNT:
-            logger.warning(f"--workers={workers} exceeds CPU count ({CPU_COUNT})")
-        return workers
-    except ValueError:
-        raise AssertionError(f"--workers must be positive integer, got: {raw_workers}")
-
-
-def _parse_ids(raw_ids):
-    """Parse title ids given to details command, drop duplicates, keep order"""
-    for raw_id in raw_ids:
-        assert raw_id.isdigit(), f"Title id must be a number, got: {raw_id}"
-    return tuple(dict.fromkeys(int(raw_id) for raw_id in raw_ids))
-
-
-def details(raw_ids, workers):
-    """Print extended info about titles with given ids (json to stdout)"""
-    ids = _parse_ids(raw_ids)
-    pool = multiprocessing.Pool(processes=min(workers, len(ids)))
-    try:
-        logger.info("Fetching details...")
-        raw_details = tuple(
-            json.loads(el)
-            for el in tqdm.tqdm(
-                pool.imap_unordered(getter.get_details, ids), total=len(ids)
+def search(args: dict, pool: multiprocessing.Pool):
+    """Search titles by text, then get info (incl. poster) about found titles"""
+    query = " ".join(args["<query>"]).strip()
+    assert query, "Empty search query"
+    title_types = parser.normalize_title_types(args["--type"])
+    limit = parser.parse_positive_int(args["--limit"], "--limit", 10)
+    page = parser.parse_positive_int(args["--page"], "--page", 1)
+    strict_query = query if args["--strict"] else None
+    logger.info(f"Searching for '{query}' [1/2]...")
+    # Search also returns people, characters etc., and titles of other types than
+    # requested are dropped, so one page of results can hold fewer than `limit`
+    # titles. Next pages are read (up to MAX_SEARCH_PAGES requests) to fill it up.
+    hits = []
+    total = 0
+    for current_page in range(page, page + MAX_SEARCH_PAGES):
+        response = getter.search(query, current_page, limit)
+        total = response.get("total", 0)
+        page_hits = parser.parse_search_hits(
+            response,
+            title_types,
+            exclude_ids={hit["movie_id"] for hit in hits},
+            strict_query=strict_query,
+        )
+        hits.extend(page_hits)
+        no_more_results = (
+            not response.get("searchHits") or current_page * limit >= total
+        )
+        if len(hits) >= limit or no_more_results:
+            break
+    hits = tuple(hits[:limit])
+    assert hits, (
+        f"No titles found for '{query}' (starting from page {page}; "
+        f"search found {total} entries of all kinds)"
+    )
+    ids = tuple(hit["movie_id"] for hit in hits)
+    logger.info(f"Fetching info about {len(ids)} titles [2/2]...")
+    details = _get_details(ids, pool)
+    movies = parser.merge_data(ids, [hits, details])
+    if args["--embed-images"]:
+        logger.info("Downloading posters...")
+        images = tuple(
+            tqdm.tqdm(
+                pool.imap(
+                    getter.get_image_data_uri, [m.get("poster_url") for m in movies]
+                ),
+                total=len(movies),
             )
         )
-        details_by_id = {entry["entity"]: entry for entry in raw_details}
-        titles = [parser.parse_details(details_by_id[title_id]) for title_id in ids]
-        print(json.dumps(titles, ensure_ascii=False, indent=2))
-    except Exception as e:  # noqa
-        logger.error(f"Program error: {e!s}")
-    finally:
-        pool.close()
+        movies = tuple({**m, "poster_image": image} for m, image in zip(movies, images))
+        missing = sum(1 for m in movies if m["poster_image"] is None)
+        if missing:
+            logger.warning(f"No poster image for {missing} of {len(movies)} titles")
+    return query, movies
+
+
+def user_export(args: dict, pool: multiprocessing.Pool):
+    """
+    Export user data
+    """
+    user = args["<username>"]
+    cookie = args["<cookie>"]
+    assert all([user, cookie]), "Empty arguments provided"
+    title_types = parser.normalize_title_types(args["--type"])
+    first_page, last_page = parser.parse_pages(args["--pages"])
+    raw_since = args["--since"]
+    since_ms = parser.parse_since(raw_since)
+    cookie = re.sub("Cookie:", "", cookie).strip()
+    logged_in_user = getter.auth_check(cookie)
+    friend_query = user != logged_in_user
+    user_ratings_by_type = []
+    logger.info("Fetching list of rated titles [1/3]...")
+    for title_type in title_types:
+        votes_total = getter.get_votes_count(user, title_type)
+        pages = ceil(votes_total / MOVIES_PER_PAGE)
+        if pages == 0:
+            logger.info(f"Skipping {title_type}, no ratings found")
+            continue
+        end_page = pages if last_page is None else min(last_page, pages)
+        if first_page > end_page:
+            logger.info(
+                f"Skipping {title_type}, requested pages start after last page ({pages})"
+            )
+            continue
+        pages_to_fetch = end_page - first_page + 1
+        logger.info(
+            f"Fetching list of {title_type} ratings (pages {first_page}-{end_page} of {pages})..."
+        )
+        get_titles_page_args = (
+            (cookie, user, friend_query, title_type, page)
+            for page in range(first_page, end_page + 1)
+        )
+        user_ratings_raw = tuple(
+            tqdm.tqdm(
+                pool.imap_unordered(getter.get_titles_page, get_titles_page_args),
+                total=pages_to_fetch,
+            )
+        )
+        user_ratings_by_type.append(
+            tuple(
+                itertools.chain.from_iterable(json.loads(el) for el in user_ratings_raw)
+            )
+        )
+    user_ratings = tuple(
+        el
+        for el in itertools.chain.from_iterable(user_ratings_by_type)
+        if el.get("timestamp", 0) >= since_ms
+    )
+    total_titles = len(user_ratings)
+    since_msg = "" if raw_since is None else f" since {raw_since}"
+    logger.info(f"User {user} has {total_titles} rated titles{since_msg}...")
+    assert total_titles, "No rated titles available"
+    ids = tuple(el.get("movie_id") for el in user_ratings)
+    logger.info("Fetching info about titles [2/3]...")
+    details = _get_details(ids, pool)
+    logger.info("Fetching global rating for titles [3/3]...")
+    global_rating = tuple(
+        json.loads(el)
+        for el in tqdm.tqdm(
+            pool.imap_unordered(getter.get_global_rating, ids), total=total_titles
+        )
+    )
+    return user, parser.merge_data(ids, [user_ratings, details, global_rating])
 
 
 def main():
@@ -168,100 +207,35 @@ def main():
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
-    if args["details"]:
-        return details(args["<id>"], _resolve_workers(args["--workers"]))
-    user = args["<username>"]
-    cookie = args["<cookie>"]
-    assert all([user, cookie]), "Empty arguments provided"
-    formats = {f.lower() for f in (args["--format"] or ("json",))}
-    assert formats and formats.issubset(FORMATS), f"Supported file formats: {FORMATS}"
-    title_types = _normalize_title_types(args["--type"])
-    first_page, last_page = _parse_pages(args["--pages"])
-    raw_since = args["--since"]
-    since_ms = _parse_since(raw_since)
-    with_details = args["--details"]
-    steps = 5 if with_details else 4
-    workers = _resolve_workers(args["--workers"])
+    workers = parser.resolve_workers(args["--workers"], CPU_COUNT)
     pool = multiprocessing.Pool(processes=workers)
     try:
-        logger.info("Checking args...")
-        cookie = re.sub("Cookie:", "", cookie).strip()
-        logged_in_user = getter.auth_check(cookie)
-        friend_query = user != logged_in_user
-        user_ratings_by_type = []
-        logger.info(f"Fetching list of rated titles [1/{steps}]...")
-        for title_type in title_types:
-            api_title_type = TITLE_TYPE_TO_API[title_type]
-            votes_total = getter.get_votes_count(user, api_title_type)
-            pages = ceil(votes_total / MOVIES_PER_PAGE)
-            if pages == 0:
-                logger.info(f"Skipping {title_type}, no ratings found")
-                continue
-            end_page = pages if last_page is None else min(last_page, pages)
-            if first_page > end_page:
-                logger.info(
-                    f"Skipping {title_type}, requested pages start after last page ({pages})"
-                )
-                continue
-            pages_to_fetch = end_page - first_page + 1
-            logger.info(
-                f"Fetching list of {title_type} ratings (pages {first_page}-{end_page} of {pages})..."
+        formats = {f.lower() for f in (args["--format"] or ("json",))}
+        write_stdout = args["--stdout"]
+        if write_stdout:
+            assert len(formats) == 1, (
+                f"Only one format can be written to stdout, passed: {formats}"
             )
-            get_titles_page_args = (
-                (cookie, user, friend_query, api_title_type, page)
-                for page in range(first_page, end_page + 1)
-            )
-            user_ratings_raw = tuple(
-                tqdm.tqdm(
-                    pool.imap_unordered(getter.get_titles_page, get_titles_page_args),
-                    total=pages_to_fetch,
-                )
-            )
-            user_ratings_by_type.append(
-                tuple(
-                    itertools.chain.from_iterable(
-                        json.loads(el) for el in user_ratings_raw
-                    )
-                )
-            )
-        user_ratings = tuple(
-            el
-            for el in itertools.chain.from_iterable(user_ratings_by_type)
-            if el.get("timestamp", 0) >= since_ms
+        supported_formats = {"csv", "json", "letterboxd"}
+        assert formats and formats.issubset(supported_formats), (
+            f"Supported file formats: {supported_formats}"
         )
-        total_titles = len(user_ratings)
-        since_msg = "" if raw_since is None else f" since {raw_since}"
-        logger.info(f"User {user} has {total_titles} rated titles{since_msg}...")
-        assert total_titles, "No rated titles available"
-        ids = tuple(el.get("entity") for el in user_ratings)
-        logger.info(f"Fetching info about titles [2/{steps}]...")
-        global_info = tuple(
-            json.loads(el)
-            for el in tqdm.tqdm(
-                pool.imap_unordered(getter.get_global_info, ids), total=total_titles
+        if args["search"]:
+            assert formats.issubset({"csv", "json"}), (
+                "Search supports file formats: csv, json"
             )
-        )
-        logger.info(f"Fetching global rating for titles [3/{steps}]...")
-        global_rating = tuple(
-            json.loads(el)
-            for el in tqdm.tqdm(
-                pool.imap_unordered(getter.get_global_rating, ids), total=total_titles
+            embed_images = args["--embed-images"]
+            assert not embed_images or formats == {"json"}, (
+                "--embed-images works only with json format"
             )
-        )
-        titles_details = None
-        if with_details:
-            logger.info(f"Fetching details for titles [4/{steps}]...")
-            titles_details = tuple(
-                parser.parse_details(json.loads(el))
-                for el in tqdm.tqdm(
-                    pool.imap_unordered(getter.get_details, ids), total=total_titles
-                )
-            )
-        logger.info(f"Writing data [{steps}/{steps}]...")
-        movies = parser.merge_data(
-            ids, user_ratings, global_info, global_rating, titles_details
-        )
-        parser.write_data(movies, user, formats)
+            query, movies = search(args, pool)
+            writer.write_search(movies, query, write_stdout, formats, embed_images)
+        elif args["details"]:
+            movies = details(args, pool)
+            writer.write_details(movies, write_stdout, formats)
+        else:
+            user, movies = user_export(args, pool)
+            writer.write_user_export(movies, user, write_stdout, formats)
     except Exception as e:  # noqa
         logger.error(f"Program error: {e!s}")
     finally:

@@ -1,98 +1,48 @@
-import csv
-import json
 import logging
+import re
+import unicodedata
 from datetime import datetime
 from urllib.parse import quote_plus
 
 logger = logging.getLogger(__name__)
 
-TITLE_TYPE_OUTPUT_MAPPING = {"film": "movie", "serial": "tv_show", "videogame": "game"}
-KEY_MAPPING = {
-    "timestamp": "timestamp",
-    "favorite": "favorite",
-    "rate": "user_rating",
-    "global_rate": "global_rating",
-    "count": "global_rating_count",
-    "originalTitle": "original_title",
-    "title": "pl_title",
-    "year": "year",
-    "entity": "movie_id",
-    "type": "title_type",
-    "subType": "title_sub_type",
-    "url": "url",
-    "date": "date",
-}
-# extended info (api film/<id>/preview), added to export only with --details
-DETAILS_KEYS = ("poster_url", "genres", "countries", "duration", "directors")
 POSTER_URL_PREFIX = "https://fwcdn.pl/fpo"
 POSTER_SIZE = 10  # size used by filmweb in the list of ratings
-# TODO? countVote1 and so on keys ingnored for now, histogram info?
+DEFAULT_TITLE_TYPES = {"movie", "tv_show", "game"}
+TITLE_TYPE_ALIASES = {
+    "film": "movie",
+    "films": "movie",
+    "movie": "movie",
+    "movies": "movie",
+    "serial": "tv_show",
+    "series": "tv_show",
+    "show": "tv_show",
+    "shows": "tv_show",
+    "tv": "tv_show",
+    "tvshow": "tv_show",
+    "tvshows": "tv_show",
+    "tv_show": "tv_show",
+    "tv_shows": "tv_show",
+    "gra": "game",
+    "gry": "game",
+    "videogame": "game",
+    "videogames": "game",
+    "game": "game",
+    "games": "game",
+}
+TITLE_TYPE_TO_API = {"movie": "film", "tv_show": "serial", "game": "videogame"}
+TITLE_TYPE_OUTPUT_MAPPING = {"film": "movie", "serial": "tv_show", "videogame": "game"}
+SEARCH_TYPE_NAMES = {"videogame": "game"}  # api name -> name used in search hits
 
 
-def merge_data(ids, user_ratings, global_info, global_rating, details=None):
+def _movie_id_key(data: list[dict]):
     """
-    Merge all data into one
+    Parse and reformat data into dict with movie_id as key
     """
-    all_data = tuple(
-        _movie_id_key(el) for el in (user_ratings, global_info, global_rating)
-    )
-    merged = ({**all_data[0][id], **all_data[1][id], **all_data[2][id]} for id in ids)
-    movies = tuple(_fix_keys(entry) for entry in merged)
-    if details is None:
-        return movies
-    details_by_id = {entry["movie_id"]: entry for entry in details}
-    return tuple(
-        {
-            **movie,
-            **{key: details_by_id[movie["movie_id"]][key] for key in DETAILS_KEYS},
-        }
-        for movie in movies
-    )
+    return {entry["movie_id"]: entry for entry in data}
 
 
-def parse_details(entry):
-    """
-    Parse response of film preview api into title info
-    """
-    poster = (entry.get("poster") or {}).get("path")
-    title = (entry.get("title") or {}).get("title")
-    original_title = (entry.get("originalTitle") or {}).get("title")
-    entity_name = entry.get("entityName")
-    genres = (
-        ((genre or {}).get("name") or {}).get("text")
-        for genre in _list(entry, "genres")
-    )
-    return {
-        "movie_id": entry["entity"],
-        "original_title": original_title or title,
-        "pl_title": title or original_title,
-        "year": entry.get("year"),
-        "title_type": TITLE_TYPE_OUTPUT_MAPPING.get(entity_name, entity_name),
-        "title_sub_type": entry.get("subType"),
-        "poster_url": _poster_url(poster),
-        "genres": [genre for genre in genres if genre],
-        "countries": [
-            country["code"]
-            for country in _list(entry, "countries")
-            if country.get("code")
-        ],
-        "duration": entry.get("duration"),
-        "directors": [
-            director["name"]
-            for director in _list(entry, "directors")
-            if director.get("name")
-        ],
-    }
-
-
-def _list(entry, key):
-    """
-    Value for key that should be a list, empty list if missing
-    """
-    return entry.get(key) or []
-
-
-def _poster_url(path):
+def _poster_url(path: str | None) -> str | None:
     """
     Build url of poster image from api path, e.g.
     /39/15/643915/7889447_1.$.jpg -> https://fwcdn.pl/fpo/39/15/643915/7889447_1.10.webp
@@ -103,18 +53,55 @@ def _poster_url(path):
     return f"{POSTER_URL_PREFIX}{base.replace('$', str(POSTER_SIZE))}.webp"
 
 
-def _movie_id_key(data):
+def merge_data(ids: tuple[int], data: list[list[dict]]) -> tuple[dict]:
     """
-    Parse and reformat data into dict with movie_id as key
+    Merge all data into one
     """
-    return {entry["entity"]: entry for entry in data}
+    dicts = tuple(_movie_id_key(el) for el in data)
+    merged = tuple(
+        {key: value for d in dicts for key, value in d.get(movie_id, {}).items()}
+        for movie_id in ids
+    )
+    return merged
 
 
-def _fix_keys(entry):
+def normalize_title_types(raw_types: list[str]) -> tuple[str]:
+    """Normalize user title type values to supported API types"""
+    if not raw_types:
+        title_types = DEFAULT_TITLE_TYPES
+    else:
+        raw_types = [title_type.lower().strip() for title_type in raw_types]
+        if "all" in raw_types:
+            title_types = DEFAULT_TITLE_TYPES
+        else:
+            title_types = set()
+            for title_type in raw_types:
+                resolved = TITLE_TYPE_ALIASES.get(title_type, None)
+                assert resolved is not None, f"Unsupported title type: {title_type}"
+                title_types.add(resolved)
+    return tuple(TITLE_TYPE_TO_API[t] for t in title_types)
+
+
+def parse_details(entry: dict):
     """
-    Fix keys names for data
+    Parse response of film preview api into title info
     """
-    fixed = {new_key: entry.get(old_key) for old_key, new_key in KEY_MAPPING.items()}
+    fixed = {
+        "movie_id": entry.get("movie_id"),
+        "duration": entry.get("duration"),
+        "poster_url": _poster_url((entry.get("poster") or {}).get("path")),
+        "pl_title": entry.get("title", {}).get("title"),
+        "original_title": entry.get("originalTitle", {}).get("title"),
+        "year": entry.get("year"),
+        "title_type": entry.get("entityName"),
+        "title_sub_type": entry.get("subType"),
+        "plot": entry.get("plotOrDescriptionSynopsis"),
+        "genres": [
+            genre.get("name", {}).get("text") for genre in entry.get("genres", [])
+        ],
+        "directors": [director.get("name") for director in entry.get("directors", [])],
+        "countries": [country.get("code") for country in entry.get("countries", [])],
+    }
     fixed["title_type"] = TITLE_TYPE_OUTPUT_MAPPING.get(
         fixed.get("title_type"), fixed.get("title_type")
     )
@@ -126,69 +113,127 @@ def _fix_keys(entry):
         f"""{(fixed["pl_title"] or "").strip()}-{fixed["year"]}-{fixed["movie_id"]}"""
     )
     fixed["url"] = f"https://www.filmweb.pl/film/{path}"
-    fixed["date"] = datetime.fromtimestamp(fixed["timestamp"] / 1000).strftime(
-        "%Y-%m-%d"
+    return fixed
+
+
+def _fold(text: str | None) -> str:
+    """Lowercase text without diacritics (Ł -> l, ą -> a), for loose comparison"""
+    text = (text or "").casefold().replace("ł", "l")
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def matches_all_words(text: str | None, query: str) -> bool:
+    """True if every word of the query appears in text (ignoring case, diacritics)"""
+    folded = _fold(text)
+    return all(word in folded for word in _fold(query).split())
+
+
+def parse_search_hits(
+    data: dict,
+    title_types: tuple[str],
+    exclude_ids: set[int] | None = None,
+    strict_query: str | None = None,
+) -> tuple[dict]:
+    """
+    Parse response of search api into list of title hits (in the order of relevance).
+    Search returns also people and characters, they are dropped here, as well as
+    titles of types not requested. `title_types` are api names (film, serial,
+    videogame). Search names games differently than the rest of the api ("game"
+    instead of "videogame"), so the names are translated first.
+    Hits with ids in `exclude_ids` (e.g. from previous pages) are skipped.
+    With `strict_query` only hits whose matched title contains all words of the
+    query are kept: the search matches any of the words, so "shrek trzeci" finds
+    also "Trzeci człowiek". `matchedTitle` is the title the query was matched
+    against (any language), so there is no need to look at the other titles.
+    Search does not return year or poster, these come from the preview api.
+    """
+    wanted = {SEARCH_TYPE_NAMES.get(t, t) for t in title_types}
+    hits = []
+    seen = set(exclude_ids or ())
+    for hit in data.get("searchHits") or []:
+        hit_id = hit.get("id")
+        if hit.get("type") not in wanted or hit_id is None or hit_id in seen:
+            continue
+        if strict_query and not matches_all_words(
+            hit.get("matchedTitle"), strict_query
+        ):
+            continue
+        seen.add(hit_id)
+        hits.append(
+            {
+                "movie_id": hit_id,
+                "matched_title": hit.get("matchedTitle"),
+                "matched_lang": hit.get("matchedLang"),
+                "main_cast": [
+                    person.get("name") for person in hit.get("filmMainCast") or []
+                ],
+            }
+        )
+    return tuple(hits)
+
+
+def parse_positive_int(raw_value: str | None, option: str, default: int) -> int:
+    """Parse numeric option that has to be >= 1, use default if not given"""
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        raise AssertionError(f"{option} must be positive integer, got: {raw_value}")
+    assert value >= 1, f"{option} must be positive integer, got: {raw_value}"
+    return value
+
+
+def parse_pages(raw_pages: str) -> tuple[int, int]:
+    """Parse --pages value into (first, last) tuple, last=None means 'to the end'"""
+    if raw_pages is None:
+        return (1, None)
+    match = re.fullmatch(r"\s*(\d+)\s*(-\s*(\d*))?\s*", raw_pages)
+    assert match, f"--pages must look like 3, 2-5 or 4-, got: {raw_pages}"
+    first = int(match.group(1))
+    if match.group(2) is None:
+        last = first
+    else:
+        last = int(match.group(3)) if match.group(3) else None
+    assert first >= 1, "--pages must start at page 1 or later"
+    assert last is None or last >= first, (
+        "--pages range end must not be lower than its start"
     )
-    return fixed
+    return (first, last)
 
 
-def _write_csv(file_name, field_names, movies):
+def parse_since(raw_since: str) -> int:
     """
-    Helper for writing csv
+    Parse --since value (YYYY-MM-DD) into timestamp in ms, None means 'no limit'.
+    The day is inclusive: the limit is local midnight, the same timezone
+    that is used for the `date` column in the output.
     """
-    with open(file_name, "w", encoding="utf-8") as out_file:
-        writer = csv.DictWriter(out_file, fieldnames=field_names, dialect="unix")
-        writer.writeheader()
-        for movie in movies:
-            # list values (genres etc.) are joined, csv has no list type
-            writer.writerow(
-                {
-                    key: "; ".join(map(str, value))
-                    if isinstance(value, list)
-                    else value
-                    for key, value in movie.items()
-                }
-            )
-    return True
+    if raw_since is None:
+        return 0
+    try:
+        since = datetime.strptime(raw_since.strip(), "%Y-%m-%d")
+    except ValueError:
+        raise AssertionError(f"--since must look like 2026-10-19, got: {raw_since}")
+    return int(since.timestamp() * 1000)
 
 
-def _letterbox_entry(entry):
-    """
-    Format letterboxd column names
-    https://letterboxd.com/about/importing-data/
-    """
-    fixed = {
-        "Title": entry.get("original_title"),
-        "Year": entry.get("year"),
-        "Rating10": entry.get("user_rating"),
-        "WatchedDate": entry.get("date"),
-    }
-    return fixed
+def resolve_workers(raw_workers: str, default: int) -> int:
+    """Number of parallel workers: CPU count by default"""
+    if raw_workers is None:
+        return default
+    try:
+        workers = int(raw_workers)
+        assert workers >= 1, "--workers must be at least 1"
+        if workers > default:
+            logger.warning(f"--workers={workers} exceeds default CPU count ({default})")
+        return workers
+    except ValueError:
+        raise AssertionError(f"--workers must be positive integer, got: {raw_workers}")
 
 
-def write_data(movies, user, formats):
-    """Write export data to requested output formats"""
-    assert movies, "no data to write"
-    date = datetime.now().strftime("%Y%m%d")
-    written_files = []
-    if "json" in formats:
-        file_name = f"{user}_{date}.json"
-        with open(file_name, "w", encoding="utf-8") as out_file:
-            out_file.write(json.dumps(movies))
-        logger.info(f"{file_name} written!")
-        written_files.append(file_name)
-    if "csv" in formats:
-        file_name = f"{user}_{date}.csv"
-        field_names = [*KEY_MAPPING.values()]
-        if "poster_url" in movies[0]:
-            field_names.extend(DETAILS_KEYS)
-        _write_csv(file_name, field_names, movies)
-        logger.info(f"{file_name} written!")
-        written_files.append(file_name)
-    if "letterboxd" in formats:
-        file_name = f"{user}_{date}_letterboxd.csv"
-        movies_letterbox = tuple(_letterbox_entry(entry) for entry in movies)
-        _write_csv(file_name, movies_letterbox[0].keys(), movies_letterbox)
-        logger.info(f"{file_name} written!")
-        written_files.append(file_name)
-    return tuple(written_files)
+def parse_ids(raw_ids: list[str]) -> tuple[int]:
+    """Parse title ids given to details command, drop duplicates, keep order"""
+    for raw_id in raw_ids:
+        assert raw_id.isdigit(), f"Title id must be a number, got: {raw_id}"
+    return tuple(dict.fromkeys(int(raw_id) for raw_id in raw_ids))

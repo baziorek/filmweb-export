@@ -1,4 +1,8 @@
+import base64
 import json
+from datetime import datetime
+from typing import Any
+from urllib.parse import urlencode
 
 import requests
 
@@ -19,10 +23,16 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
     "Sec-GPC": "1",
     "TE": "trailers",
+    "x-locale": "pl-PL",
+}
+IMAGE_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Referer": "https://www.filmweb.pl/",
+    "Accept": "image/webp,image/*,*/*",
 }
 
 
-def get_titles_page(args):
+def get_titles_page(args: dict) -> str:
     """
     request title page
     """
@@ -33,10 +43,16 @@ def get_titles_page(args):
     else:
         url = f"https://www.filmweb.pl/api/v1/logged/vote/title/{title_type}?page={n}"
     data = _get_json(url, cookie, "get_titles_page")
+    for entry in data:
+        entry["movie_id"] = entry.get("entity")
+        entry["user_rating"] = entry.get("rate")
+        entry["date"] = datetime.fromtimestamp(entry["timestamp"] / 1000).strftime(
+            "%Y-%m-%d"
+        )
     return json.dumps(data)
 
 
-def auth_check(cookie):
+def auth_check(cookie: str) -> str:
     """
     Check if auth is OK (valid cookie after login)
     """
@@ -46,7 +62,7 @@ def auth_check(cookie):
     return user
 
 
-def get_votes_count(user, title_type):
+def get_votes_count(user: str, title_type: str) -> Any:
     """
     Get total count of user votes for one title type: https://www.filmweb.pl/api/v1/user/{user}/votes/{title_type}/count
         Args:
@@ -57,43 +73,66 @@ def get_votes_count(user, title_type):
     return _get_json(url, "", "get_votes_count")
 
 
-def get_global_info(title_id):
-    """
-    Get info about a title (title etc)
-    """
-    url = f"https://www.filmweb.pl/api/v1/title/{title_id}/info"
-    data = _get_json(url, "", "get_global_info")
-    data["entity"] = title_id
-    return json.dumps(data)
-
-
-def get_global_rating(title_id):
+def get_global_rating(title_id: int) -> str:
     """
     Get global rating for a title
     """
     url = f"https://www.filmweb.pl/api/v1/film/{title_id}/rating"
     data = _get_json(url, "", "get_global_rating")
-    data["entity"] = title_id
-    data["global_rate"] = data.pop("rate")
+    data["movie_id"] = title_id
+    data["global_rating"] = data.get("rate")
+    data["global_rating_count"] = data.get("count")
+    data["global_rating_histogram"] = {
+        rating: data.get(f"countVote{rating}") for rating in range(1, 11)
+    }
     return json.dumps(data)
 
 
-def get_details(title_id):
+def get_preview(title_id: int) -> str:
     """
-    Get extended info about a title (genres, countries, poster etc.)
+    Get info about a title
     """
     url = f"https://www.filmweb.pl/api/v1/film/{title_id}/preview"
-    data = _get_json(url, "", "get_details", {"x-locale": "pl-PL"})
-    data["entity"] = title_id
+    data = _get_json(url, "", "get_preview")
+    data["movie_id"] = title_id
     return json.dumps(data)
 
 
-def _get_json(url, cookie, func_name, extra_headers=None):
+def search(query: str, page: int, page_size: int) -> dict:
+    """
+    Search titles (and people, characters...) by text, no login needed
+    """
+    params = urlencode({"query": query, "pageSize": page_size, "page": page})
+    url = f"https://www.filmweb.pl/api/v1/live/search?{params}"
+    return _get_json(url, "", "search")
+
+
+def get_image_data_uri(url: str | None) -> str | None:
+    """
+    Download image and return it as data uri (data:image/webp;base64,...),
+    so it can be embedded in json. Returns None if there is no image or the
+    download failed - a missing poster should not break the whole search.
+    """
+    if not url:
+        return None
+    try:
+        # images are served by another host (fwcdn.pl), so HEADERS
+        # (Host, Origin of www.filmweb.pl) must not be used here
+        response = requests.get(url, headers=IMAGE_HEADERS, timeout=30)
+        response.raise_for_status()
+        mime = response.headers.get("Content-Type", "image/webp").split(";")[0].strip()
+        encoded = base64.b64encode(response.content).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+    except Exception:  # noqa
+        return None
+
+
+def _get_json(url: str, cookie: str, func_name: str) -> Any:
     """
     Wrapper for request and unified error
     """
     try:
-        headers = {"Cookie": cookie, **HEADERS, **(extra_headers or {})}
+        headers = {"Cookie": cookie, **HEADERS}
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         content = response.json()
